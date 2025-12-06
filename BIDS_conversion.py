@@ -51,9 +51,6 @@ def map_to_bids_modality(series_desc, study_desc, sequence_name, dcm):
         return "misc", "unknown"
 
 def group_dicoms_by_series(dicom_root):
-    """
-    Group all DICOM files by SeriesInstanceUID within the given folder.
-    """
     series_dict = defaultdict(list)
     for root, _, files in os.walk(dicom_root):
         for file in tqdm.tqdm(files):
@@ -71,7 +68,7 @@ def group_dicoms_by_series(dicom_root):
                 
                 if getattr(dcm, "Modality", "") != "MR":
                     continue
-
+                
                 # Skip irrelevant series (screenshots, scouts, localizers)
                 if any(k in desc for k in ["screenshot", "mpr", "scout", "localizer", "survey", "pilot", "loc"]):
                     continue
@@ -80,7 +77,7 @@ def group_dicoms_by_series(dicom_root):
                 image_type = [str(x).upper() for x in getattr(dcm, "ImageType", [])]
                 if any(tag in image_type for tag in ["DERIVED", "SECONDARY", "PROCESSED"]):
                     continue
-
+                
                 key = (
                     getattr(dcm, "StudyInstanceUID", "Unknown"),
                     getattr(dcm, "SeriesNumber", "0"),
@@ -107,7 +104,7 @@ def sort_and_check_slices(dicom_files):
     orientation = np.array(dcm0.ImageOrientationPatient, dtype=float)
     row_cos = orientation[:3]
     col_cos = orientation[3:]
-    slice_cos = np.cross(row_cos, col_cos)  # Slice direction vector
+    slice_cos = np.cross(row_cos, col_cos) # Slice direction vector
 
     # Compute slice position along slice direction
     slice_positions = []
@@ -116,33 +113,131 @@ def sort_and_check_slices(dicom_files):
         ipp = np.array(dcm.ImagePositionPatient, dtype=float)
         loc = np.dot(ipp, slice_cos)
         slice_positions.append((loc, file))
-
+        
     # Sort slices by their position
     slice_positions.sort(key=lambda x: x[0])
     sorted_files = [f for _, f in slice_positions]
-
+    
     # Estimate slice spacing
-    spacings = np.diff(sorted([pos for pos, _ in slice_positions]))
+    spacings = np.diff([pos for pos, _ in slice_positions])
     if len(spacings) == 0:
         return sorted_files, False
-    median_spacing = np.median(spacings)
-
+    median_spacing = np.median(spacings) 
+    
     # Detect missing slices if spacing exceeds ±20% of the median spacing
-    missing = np.any(spacings > median_spacing * 1.2)
+    missing = np.any(spacings > median_spacing * 1.2) if len(spacings) > 0 else False
     return sorted_files, missing
 
+# ----------------- Visualize Z positions -----------------
+def visualize_z_positions(dicom_files, small_thresh=0.001, large_thresh=0.5):
+    """
+    Print Z coordinates and flag duplicates or deviations:
+    ↓ = duplicate
+    ↘ = small deviation
+    ↗ = large deviation
+    """
+    z_list = []
+    info_list = []
+    for f in dicom_files:
+        try:
+            dcm = pydicom.dcmread(f, stop_before_pixels=True)
+            z = float(dcm.ImagePositionPatient[2])
+            inst = int(getattr(dcm, "InstanceNumber", 0))
+            z_list.append(z)
+            info_list.append((f, inst, z))
+        except:
+            continue
+
+    if not z_list:
+        print("No valid slices to visualize")
+        return
+
+    print("Instance | Z(mm)   | Flag")
+    prev_z = None
+    for f, inst, z in info_list:
+        flag = ""
+        if prev_z is not None:
+            diff = abs(z - prev_z)
+            if diff < small_thresh:
+                flag = "↓ duplicate"
+            elif diff < large_thresh:
+                flag = "↘ small Δ"
+            else:
+                flag = "↗ large Δ"
+        print(f"{inst:6} | {z:7.3f} | {flag}")
+        prev_z = z
+        
+def remove_duplicate_z(dicom_files):
+    seen_z = set()
+    filtered_files = []
+    for f in dicom_files:
+        try:
+            dcm = pydicom.dcmread(f, stop_before_pixels=True)
+            z = round(float(dcm.ImagePositionPatient[2]), 3)
+            if z not in seen_z:
+                filtered_files.append(f)
+                seen_z.add(z)
+        except Exception:
+            continue
+    return filtered_files
+
+def diagnose_series(dicom_files):
+    slices = []
+    for f in dicom_files:
+        dcm = pydicom.dcmread(f, stop_before_pixels=True)
+        inst = int(getattr(dcm, "InstanceNumber", 0))
+        z = float(dcm.ImagePositionPatient[2])
+        orientation = tuple(round(x, 6) for x in dcm.ImageOrientationPatient)
+        slices.append((f, inst, z, orientation))
+
+    slices.sort(key=lambda x: x[2])
+    duplicates_z = []
+    non_monotonic_inst = []
+    orientation_set = set()
+    spacings = []
+
+    prev_inst = None
+    prev_z = None
+    for f, inst, z, ori in slices:
+        if prev_z is not None:
+            if abs(z - prev_z) < 1e-3:
+                duplicates_z.append(f)
+            spacings.append(z - prev_z)
+        if prev_inst is not None and inst < prev_inst:
+            non_monotonic_inst.append((f, inst, prev_inst))
+        prev_inst = inst
+        prev_z = z
+        orientation_set.add(ori)
+
+    median_spacing = np.median(spacings) if spacings else 0
+    spacing_issue = any(abs(s - median_spacing) > 0.01 for s in spacings)
+    orientation_issue = len(orientation_set) > 1
+
+    issues = []
+    if duplicates_z:
+        issues.append(f"Duplicate Z positions ({len(duplicates_z)} slices) – ignored")
+    if non_monotonic_inst:
+        issues.append(f"Non-monotonic InstanceNumbers ({len(non_monotonic_inst)} slices)")
+    if spacing_issue:
+        issues.append(f"Slice spacing inconsistent (median={median_spacing:.4f})")
+    if orientation_issue:
+        issues.append(f"Orientation mismatch ({len(orientation_set)} orientations)")
+    if not issues:
+        issues.append("No obvious issue detected")
+
+    return "; ".join(issues)
+
+# ----------------- Convert to BIDS -----------------
 def convert_to_bids(series_dict, bids_root):
     """
     Convert grouped DICOM series into NIfTI files following the BIDS structure.
     """
     report = []
-    
     success_list = []
     timeout_list = []
     failed_list = []
-    
+
     os.makedirs(bids_root, exist_ok=True)
-    
     temp_root = os.path.join(bids_root, "_tmp_series")
     os.makedirs(temp_root, exist_ok=True)
 
@@ -154,11 +249,12 @@ def convert_to_bids(series_dict, bids_root):
             continue
         # if missing:
         #     continue
-        
+
+        # Remove duplicate Z slices
+        sorted_files = remove_duplicate_z(sorted_files)
+
         # dcm = pydicom.dcmread(sorted_files[0], stop_before_pixels=True)
         dcm = safe_dcmread(sorted_files[0])
-
-        # Extract relevant DICOM metadata
         patient_id = getattr(dcm, "PatientID", "Unknown")
         study_date = getattr(dcm, "StudyDate", "Unknown")
         series_number = getattr(dcm, "SeriesNumber", "0")
@@ -171,7 +267,7 @@ def convert_to_bids(series_dict, bids_root):
         bids_folder, bids_suffix = map_to_bids_modality(series_desc, study_desc, sequence_name, dcm)
         if bids_suffix == 'unknown':
             continue
-        
+
         # Use StudyDate as session ID
         session_id = study_date if study_date != "Unknown" else "ses-1"
         subject_id = f"sub-{patient_id}"
@@ -190,15 +286,14 @@ def convert_to_bids(series_dict, bids_root):
                 shutil.copy(f, series_temp_dir)
             except Exception as e:
                 print(f"[COPY ERROR] Cannot copy {f}: {e}")
-            
-        # Run dcm2niix for conversion
+
+
         cmd = [
             "dcm2niix",
-            "-z", "y",                      # gzip compression
-            "-m", "y",                      # merge slices into a single volume
-            "-f", nifti_name,               # BIDS-compliant filename
-            "-o", session_dir,              # output directory
-            # os.path.dirname(sorted_files[0]) # DICOM series folder
+            "-z", "y",
+            "-m", "y",
+            "-f", nifti_name,
+            "-o", session_dir,
             series_temp_dir
         ]
 
@@ -211,7 +306,7 @@ def convert_to_bids(series_dict, bids_root):
         # except subprocess.CalledProcessError as e:
         #     status = f"Failed: {e.stderr.strip()}"
         #     print(f"[ERROR] Series {series_desc} → {status}")
-        
+
         except subprocess.TimeoutExpired:
             status = "Timeout"
             timeout_list.append(series_uid_tmp)
@@ -219,9 +314,10 @@ def convert_to_bids(series_dict, bids_root):
             shutil.rmtree(session_dir, ignore_errors=True)
 
         except subprocess.CalledProcessError as e:
-            status = f"Failed: {e.stderr.strip()}"
-            failed_list.append(series_uid_tmp)
-            print(f"[FAILED] dcm2niix on: {series_desc}")
+            diagnostic_msg = diagnose_series(sorted_files)
+            status = f"Failed: {e.stderr.strip()} | Diagnosis: {diagnostic_msg}"
+            failed_list.append(f"{series_uid_tmp}: {diagnostic_msg}")
+            print(f"[FAILED] dcm2niix on: {series_desc} → {diagnostic_msg}")
             # shutil.rmtree(session_dir, ignore_errors=True)
             
             for f in sorted_files:
@@ -242,32 +338,33 @@ def convert_to_bids(series_dict, bids_root):
             status
         ])
 
-    # Print and save conversion report
+    # ----------------- Write conversion report -----------------
     headers = ["PatientID", "StudyDate", "Series#", "SeriesDescription",
                "SequenceName", "DICOM Files", "BIDS Path", "Status"]
     table_str = tabulate(report, headers=headers, tablefmt="grid")
     print(table_str)
-
     report_path = os.path.join(bids_root, "bids_conversion_report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(table_str)
     print(f"\nBIDS Conversion completed: {report_path}")
-    
-    
+
+
     # Optionally save lists to files
     with open(os.path.join(bids_root, "timeout_list.txt"), "w") as f:
         f.write("\n".join(timeout_list))
-
     with open(os.path.join(bids_root, "success_list.txt"), "w") as f:
         f.write("\n".join(success_list))
-
     with open(os.path.join(bids_root, "failed_list.txt"), "w") as f:
         f.write("\n".join(failed_list))
 
-
+# ----------------- Main -----------------
 if __name__ == "__main__":
-    # dicom_root = "/home/changsukoh/Documents/DICOM/output/sorted_noStructure"
-    dicom_root = '/radraid2/changsukoh/Dataset/PACS/hacksPacs/'
-    output_root = '/radraid2/bjhong/DICOM/BIDS_new/'
+    dicom_root = # insert path
+    output_root = # insert path
     series_dict = group_dicoms_by_series(dicom_root)
     convert_to_bids(series_dict, output_root)
+    
+    for key, files in series_dict.items():
+        print(f"\nSeries: {key[2]} (SeriesNumber {key[1]})")
+        sorted_files, missing = sort_and_check_slices(files)
+        visualize_z_positions(sorted_files)
